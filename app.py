@@ -12,7 +12,6 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel, Field
 
 # -------------------- YOUR EXISTING HELPERS --------------------
-# These come from your current project. Make sure they are importable.
 from os_detect import detect_os
 from git_repo import clone_and_checkout
 from venv_manager import setup, remove_venv
@@ -20,9 +19,7 @@ from deps import install_dependencies
 from dep_convert import convert_json
 from cyclo import generate_sbom
 from trivy import scan_sbom_cyclonedx, scan_sbom_json, scan_sbom_table
-from compare_trivy_dep import compare
 from language_detector import detect_language, detect_dependency_manager
-
 
 # -------------------- FASTAPI APP --------------------
 app = FastAPI(title="SBOM Scanner API", version="1.0.0")
@@ -43,6 +40,8 @@ class ScanRequest(BaseModel):
 class ScanStatus(BaseModel):
     id: str
     status: str
+    language: Optional[str] = None
+    dependency_manager: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     error: Optional[str] = None
@@ -144,17 +143,6 @@ def run_scan_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
         else:
             artifacts["trivy_table_path"] = None
 
-        # Step 9: Compare Trivy results with normalized_deps.json (optional)
-        compare_result: Optional[Any] = None
-        if Path("sbom_p.json").exists() and Path("normalized_deps.json").exists():
-            try:
-                # If your compare() returns data, capture it; if it writes files/prints, that's fine.
-                compare_result = compare("sbom_p.json", "normalized_deps.json")
-            except Exception as e:
-                compare_result = {"error": str(e)}
-
-        # Step 10: DO NOT remove venv automatically inside the API; caller can clean later.
-
     # Aggregate final report
     report: Dict[str, Any] = {
         "repo": repo_with_branch,
@@ -162,7 +150,6 @@ def run_scan_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
         "results": {
             "trivy_report_json": trivy_json,
             "trivy_cyclonedx_json": trivy_cyclonedx,
-            "compare_result": compare_result,
         },
         "generated_at": now_iso(),
     }
@@ -173,7 +160,6 @@ def run_scan_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
 
 
 # -------------------- BACKGROUND TASK --------------------
-
 def _process_job(job_id: str, giturl: str):
     job_dir = JOBS_DIR / job_id
     JOBS[job_id]["status"] = "running"
@@ -214,7 +200,7 @@ def scan_repo(req: ScanRequest, background: BackgroundTasks):
     # Start background processing
     background.add_task(_process_job, job_id, req.giturl)
 
-    return ScanStatus(id=job_id, status="pending", started_at=None, finished_at=None, error=None, report=None)
+    return ScanStatus(id=job_id, status="pending")
 
 
 @app.get("/api/getReport", response_model=ScanStatus)
@@ -228,37 +214,41 @@ def get_report(ID: str = Query(..., description="Job ID")):
         error_path = job_dir / "error.txt"
         if report_path.exists():
             report = json.loads(report_path.read_text("utf-8"))
+            artifacts = report.get("artifacts", {})
             return ScanStatus(
                 id=job_id,
                 status="completed",
-                started_at=None,
-                finished_at=None,
-                error=None,
+                language=artifacts.get("language"),
+                dependency_manager=artifacts.get("dependency_manager"),
                 report=report,
             )
         if error_path.exists():
             return ScanStatus(
                 id=job_id,
                 status="failed",
-                started_at=None,
-                finished_at=None,
                 error=error_path.read_text("utf-8"),
-                report=None,
             )
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-    # If job exists in memory, include report if completed
     record = JOBS[job_id]
     report: Optional[Dict[str, Any]] = None
+    language: Optional[str] = None
+    dependency_manager: Optional[str] = None
+
     if record.get("report_path") and Path(record["report_path"]).exists():
         try:
             report = json.loads(Path(record["report_path"]).read_text("utf-8"))
+            artifacts = report.get("artifacts", {})
+            language = artifacts.get("language")
+            dependency_manager = artifacts.get("dependency_manager")
         except Exception:
             report = None
 
     return ScanStatus(
         id=job_id,
         status=record["status"],
+        language=language,
+        dependency_manager=dependency_manager,
         started_at=record.get("started_at"),
         finished_at=record.get("finished_at"),
         error=record.get("error"),
@@ -279,15 +269,3 @@ def delete_job(job_id: str):
     if job_dir.exists():
         shutil.rmtree(job_dir)
     return {"ok": True}
-
-
-# -------------------- HOW TO RUN --------------------
-# 1) pip install fastapi uvicorn
-# 2) Make sure git and trivy are installed and available on PATH.
-# 3) uvicorn app:app --host 0.0.0.0 --port 5000 --reload
-# 4) Start a job:
-#    curl -X POST http://localhost:5000/api/scan_repo \
-#      -H 'Content-Type: application/json' \
-#      -d '{"id":"job123","giturl":"https://github.com/user/repo.git@branch"}'
-# 5) Poll for report:
-#    curl 'http://localhost:5000/api/getReport?ID=job123'
