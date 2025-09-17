@@ -11,21 +11,27 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel, Field
 
-# -------------------- YOUR EXISTING HELPERS --------------------
-# These come from your current project. Make sure they are importable.
+# -------------------- HELPERS --------------------
 from os_detect import detect_os
 from git_repo import clone_and_checkout
 from venv_manager import setup, remove_venv
 from deps import install_dependencies
 from dep_convert import convert_json
-from cyclo import generate_sbom
+from cyclo import generate_sbom as generate_python_sbom
 from trivy import scan_sbom_cyclonedx, scan_sbom_json, scan_sbom_table
 from compare_trivy_dep import compare
 from language_detector import detect_language, detect_dependency_manager
 
+# Go helpers
+from clone_repo import clone_repo
+from golang_check import is_golang_project
+from go_dependency_tree import prepare_dependencies, install_deptree, generate_dependency_tree
+from sbom_generator import generate_sbom as generate_go_sbom
+from go_trivy_scan import scan_trivy
+from go_compare import generate_comparison
 
 # -------------------- FASTAPI APP --------------------
-app = FastAPI(title="SBOM Scanner API", version="1.0.0")
+app = FastAPI(title="SBOM Scanner API", version="2.0.0")
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 BASE_DIR = Path(os.getcwd()).resolve()
@@ -36,13 +42,16 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 class ScanRequest(BaseModel):
     id: str = Field(..., description="Unique job ID for tracking.")
     giturl: str = Field(
-        ..., description="Git repo URL with optional branch (e.g. https://github.com/user/repo.git@branch)"
+        ...,
+        description="Git repo URL with optional branch (e.g. https://github.com/user/repo.git@branch)",
     )
 
 
 class ScanStatus(BaseModel):
     id: str
     status: str
+    language: Optional[str] = None
+    dependency_manager: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     error: Optional[str] = None
@@ -71,20 +80,33 @@ def now_iso() -> str:
 
 
 # -------------------- CORE PIPELINE WRAPPER --------------------
+def _safe_load_json(p: Path) -> Optional[Any]:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def run_scan_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
     """
-    Wraps your CLI pipeline into a function that returns a JSON report.
-    All side-effect files are written inside job_dir to avoid collisions.
+    Unified pipeline for Python & Go repos.
+    All side-effect files are written inside job_dir.
+    Final report includes file paths and parsed JSON results where available.
     """
     env_name = "sbom-env"
     artifacts: Dict[str, Any] = {}
+    results: Dict[str, Any] = {}
+    result_files: Dict[str, str] = {}
+
+    # Ensure job_dir exists
+    job_dir.mkdir(parents=True, exist_ok=True)
 
     with WorkDir(job_dir):
         # Step 1: Detect OS
         system = detect_os()
         artifacts["system"] = system
 
-        # Step 2: Clone repo
+        # Step 2: Clone repo (clone_and_checkout will create a folder inside job_dir)
         repo_path = Path(clone_and_checkout(repo_with_branch)).resolve()
         artifacts["repo_path"] = str(repo_path)
 
@@ -94,88 +116,152 @@ def run_scan_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
         artifacts["language"] = language
         artifacts["dependency_manager"] = manager
 
-        # Step 4 & 5: Python venv + install deps (only if Python)
-        venv_path: Optional[str] = None
+        # Initialize common paths (they will be created in CWD which is job_dir)
+        sbom_path = job_dir / "sbom.json"
+        sbom_p_path = job_dir / "sbom_p.json"  # cyclonedx processed
+        trivy_json_path = job_dir / "trivy_report.json"
+        trivy_table_path = job_dir / "table_trivy.txt"
+        normalized_deps_path = job_dir / "normalized_deps.json"
+        comparison_path = job_dir / "comparison.txt"
+
+        # -------------------- PYTHON FLOW --------------------
         if language == "Python":
+            # venv + install
             venv_path = setup(env_name=env_name, project_path=str(repo_path))
-            install_dependencies(env_name, str(repo_path))
             artifacts["venv_path"] = venv_path
+            install_dependencies(env_name, str(repo_path))
 
-        # Step 6: Normalize dets.json → normalized_deps.json (optional)
-        if Path("dets.json").exists():
-            convert_json("dets.json", "normalized_deps.json")
-            artifacts["normalized_deps_path"] = str((job_dir / "normalized_deps.json").resolve())
-        else:
-            artifacts["normalized_deps_path"] = None
+            # Normalize dets.json -> normalized_deps.json if present (dets.json created by your pipeline)
+            if Path("dets.json").exists():
+                convert_json("dets.json", str(normalized_deps_path))
+                artifacts["normalized_deps_path"] = str(normalized_deps_path.resolve())
+            else:
+                artifacts["normalized_deps_path"] = None
 
-        # Step 7: Generate SBOM if dep file exists
-        dep_file = None
-        for f in ["all-dep.txt", "a.txt"]:
-            if Path(f).exists():
-                dep_file = f
-                break
+            # Generate SBOM from dependency file if present
+            dep_file = None
+            for f in ["all-dep.txt", "a.txt"]:
+                if Path(f).exists():
+                    dep_file = f
+                    break
+            if dep_file:
+                generate_python_sbom(env_name, dep_file, str(sbom_path.name))
+                artifacts["sbom_path"] = str(sbom_path.resolve())
+                result_files["sbom"] = str(sbom_path.resolve())
+            else:
+                artifacts["sbom_path"] = None
 
-        if dep_file:
-            generate_sbom(env_name, dep_file, "sbom.json")
-            artifacts["sbom_path"] = str((job_dir / "sbom.json").resolve())
-        else:
-            artifacts["sbom_path"] = None
+            # Trivy scans (cyclonedx + json + table)
+            if sbom_path.exists():
+                scan_sbom_cyclonedx(str(sbom_path.name), str(sbom_p_path.name))
+                scan_sbom_json(str(sbom_path.name), str(trivy_json_path.name))
+                scan_sbom_table(str(sbom_path.name), str(trivy_table_path.name))
 
-        # Step 8: Scan SBOM with Trivy
-        trivy_json: Optional[Dict[str, Any]] = None
-        trivy_cyclonedx: Optional[Dict[str, Any]] = None
+                artifacts["trivy_table_path"] = str(trivy_table_path.resolve())
+                artifacts["sbom_cyclonedx_path"] = str(sbom_p_path.resolve())
+                artifacts["trivy_json_path"] = str(trivy_json_path.resolve())
 
-        if Path("sbom.json").exists():
-            scan_sbom_cyclonedx("sbom.json", "sbom_p.json")
-            scan_sbom_json("sbom.json", "trivy_report.json")
-            scan_sbom_table("sbom.json", "table_trivy.txt")
+                # Load JSON results where possible
+                results["trivy_report_json"] = _safe_load_json(trivy_json_path)
+                results["trivy_cyclonedx_json"] = _safe_load_json(sbom_p_path)
 
-            artifacts["trivy_table_path"] = str((job_dir / "table_trivy.txt").resolve())
+                result_files["trivy_report_json"] = str(trivy_json_path.resolve())
+                result_files["trivy_cyclonedx_json"] = str(sbom_p_path.resolve())
+                result_files["trivy_table"] = str(trivy_table_path.resolve())
 
-            # Load JSON outputs (best-effort)
+                # Comparison (if normalized_deps.json exists) - compare may write out or return stuff
+                if normalized_deps_path.exists():
+                    try:
+                        # If compare writes to stdout/file, try to detect/output file
+                        compare(str(sbom_p_path.name), str(normalized_deps_path.name))
+                    except Exception:
+                        # ignore compare exceptions but continue
+                        pass
+
+                    # try to find common comparison outputs
+                    if comparison_path.exists():
+                        artifacts["comparison_path"] = str(comparison_path.resolve())
+                        result_files["comparison"] = str(comparison_path.resolve())
+                    else:
+                        # place a marker if compare didn't generate a file
+                        artifacts["comparison_path"] = None
+                else:
+                    artifacts["comparison_path"] = None
+            else:
+                artifacts["trivy_table_path"] = None
+                artifacts["trivy_json_path"] = None
+                artifacts["sbom_cyclonedx_path"] = None
+                results["trivy_report_json"] = None
+                results["trivy_cyclonedx_json"] = None
+
+        # -------------------- GO FLOW --------------------
+        elif language == "Go":
+            current_folder = Path(os.getcwd())
+
+            # Prepare dependencies and generate dependency tree
             try:
-                trivy_json = json.loads(Path("trivy_report.json").read_text("utf-8"))
+                upgrade_file = prepare_dependencies(str(repo_path), current_folder)
+                artifacts["prepared_dependencies"] = str(Path(upgrade_file).resolve()) if upgrade_file else None
             except Exception:
-                trivy_json = None
+                artifacts["prepared_dependencies"] = None
+
+            install_deptree()
+            deps_file = generate_dependency_tree(str(repo_path), current_folder)
+            artifacts["deps_file"] = str(Path(deps_file).resolve()) if deps_file else None
+            result_files["deps_file"] = artifacts["deps_file"]
+
+            # Generate Go SBOM
+            sbom_file = generate_go_sbom(str(repo_path), current_folder)
+            artifacts["sbom_path"] = str(Path(sbom_file).resolve()) if sbom_file else None
+            if sbom_file:
+                result_files["sbom"] = str(Path(sbom_file).resolve())
+
+            # Trivy scan for Go SBOM
             try:
-                trivy_cyclonedx = json.loads(Path("sbom_p.json").read_text("utf-8"))
+                trivy_out = scan_trivy(str(sbom_file), current_folder)  # expected to return path
+                artifacts["trivy_json_path"] = str(Path(trivy_out).resolve()) if trivy_out else None
+                result_files["trivy_report_json"] = artifacts["trivy_json_path"]
+                results["trivy_report_json"] = _safe_load_json(Path(trivy_out)) if trivy_out else None
             except Exception:
-                trivy_cyclonedx = None
-        else:
-            artifacts["trivy_table_path"] = None
+                artifacts["trivy_json_path"] = None
+                results["trivy_report_json"] = None
 
-        # Step 9: Compare Trivy results with normalized_deps.json (optional)
-        compare_result: Optional[Any] = None
-        if Path("sbom_p.json").exists() and Path("normalized_deps.json").exists():
+            # Comparison
+            comp_file = current_folder / "comparison.txt"
             try:
-                # If your compare() returns data, capture it; if it writes files/prints, that's fine.
-                compare_result = compare("sbom_p.json", "normalized_deps.json")
-            except Exception as e:
-                compare_result = {"error": str(e)}
+                generate_comparison(str(deps_file), str(sbom_file), str(comp_file))
+            except Exception:
+                pass
+            if comp_file.exists():
+                artifacts["comparison_path"] = str(comp_file.resolve())
+                result_files["comparison"] = str(comp_file.resolve())
+            else:
+                artifacts["comparison_path"] = None
 
-        # Step 10: DO NOT remove venv automatically inside the API; caller can clean later.
+        else:
+            artifacts["unsupported"] = True
 
-    # Aggregate final report
+    # Aggregate final report: include artifact paths and parsed results (if any)
     report: Dict[str, Any] = {
         "repo": repo_with_branch,
         "artifacts": artifacts,
-        "results": {
-            "trivy_report_json": trivy_json,
-            "trivy_cyclonedx_json": trivy_cyclonedx,
-            "compare_result": compare_result,
-        },
+        "result_files": result_files,  # explicit mapping of result file names -> absolute paths
+        "results": results,  # parsed JSON outputs for convenience (when available)
         "generated_at": now_iso(),
     }
 
     # Persist report.json for GET retrieval
-    (job_dir / "report.json").write_text(json.dumps(report, indent=2), "utf-8")
+    report_path = job_dir / "report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    # also return path in artifacts for convenience
+    report["report_path"] = str(report_path.resolve())
     return report
 
 
 # -------------------- BACKGROUND TASK --------------------
-
 def _process_job(job_id: str, giturl: str):
     job_dir = JOBS_DIR / job_id
+    JOBS[job_id] = JOBS.get(job_id, {})
     JOBS[job_id]["status"] = "running"
     JOBS[job_id]["started_at"] = now_iso()
 
@@ -183,14 +269,14 @@ def _process_job(job_id: str, giturl: str):
         report = run_scan_pipeline(giturl, job_dir)
         JOBS[job_id]["status"] = "completed"
         JOBS[job_id]["finished_at"] = now_iso()
-        JOBS[job_id]["report_path"] = str((job_dir / "report.json").resolve())
+        JOBS[job_id]["report_path"] = report.get("report_path")
         JOBS[job_id]["error"] = None
     except Exception:
         JOBS[job_id]["status"] = "failed"
         JOBS[job_id]["finished_at"] = now_iso()
         err = traceback.format_exc()
         JOBS[job_id]["error"] = err
-        (job_dir / "error.txt").write_text(err, "utf-8")
+        (job_dir / "error.txt").write_text(err, encoding="utf-8")
 
 
 # -------------------- ENDPOINTS --------------------
@@ -199,8 +285,10 @@ def scan_repo(req: ScanRequest, background: BackgroundTasks):
     job_id = req.id
 
     # Reject duplicate active IDs
-    if job_id in JOBS and JOBS[job_id]["status"] in {"pending", "running"}:
-        raise HTTPException(status_code=409, detail=f"Job '{job_id}' already exists and is {JOBS[job_id]['status']}")
+    if job_id in JOBS and JOBS[job_id].get("status") in {"pending", "running"}:
+        raise HTTPException(
+            status_code=409, detail=f"Job '{job_id}' already exists and is {JOBS[job_id]['status']}"
+        )
 
     # Initialize job record
     JOBS[job_id] = {
@@ -214,51 +302,51 @@ def scan_repo(req: ScanRequest, background: BackgroundTasks):
     # Start background processing
     background.add_task(_process_job, job_id, req.giturl)
 
-    return ScanStatus(id=job_id, status="pending", started_at=None, finished_at=None, error=None, report=None)
+    return ScanStatus(id=job_id, status="pending")
 
 
 @app.get("/api/getReport", response_model=ScanStatus)
 def get_report(ID: str = Query(..., description="Job ID")):
     job_id = ID
 
+    # If job not in memory, try to load from disk
     if job_id not in JOBS:
-        # If API was restarted, try loading existing report from disk
         job_dir = JOBS_DIR / job_id
         report_path = job_dir / "report.json"
         error_path = job_dir / "error.txt"
         if report_path.exists():
-            report = json.loads(report_path.read_text("utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            artifacts = report.get("artifacts", {})
             return ScanStatus(
                 id=job_id,
                 status="completed",
-                started_at=None,
-                finished_at=None,
-                error=None,
+                language=artifacts.get("language"),
+                dependency_manager=artifacts.get("dependency_manager"),
                 report=report,
             )
         if error_path.exists():
-            return ScanStatus(
-                id=job_id,
-                status="failed",
-                started_at=None,
-                finished_at=None,
-                error=error_path.read_text("utf-8"),
-                report=None,
-            )
+            return ScanStatus(id=job_id, status="failed", error=error_path.read_text(encoding="utf-8"))
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-    # If job exists in memory, include report if completed
     record = JOBS[job_id]
     report: Optional[Dict[str, Any]] = None
+    language: Optional[str] = None
+    dependency_manager: Optional[str] = None
+
     if record.get("report_path") and Path(record["report_path"]).exists():
         try:
-            report = json.loads(Path(record["report_path"]).read_text("utf-8"))
+            report = json.loads(Path(record["report_path"]).read_text(encoding="utf-8"))
+            artifacts = report.get("artifacts", {})
+            language = artifacts.get("language")
+            dependency_manager = artifacts.get("dependency_manager")
         except Exception:
             report = None
 
     return ScanStatus(
         id=job_id,
-        status=record["status"],
+        status=record.get("status", "unknown"),
+        language=language,
+        dependency_manager=dependency_manager,
         started_at=record.get("started_at"),
         finished_at=record.get("finished_at"),
         error=record.get("error"),
@@ -272,22 +360,10 @@ def delete_job(job_id: str):
     """Delete a job's files and in-memory record."""
     job_dir = JOBS_DIR / job_id
     if job_id in JOBS:
-        if JOBS[job_id]["status"] in {"running", "pending"}:
+        if JOBS[job_id].get("status") in {"running", "pending"}:
             raise HTTPException(status_code=400, detail="Cannot delete a running job")
         JOBS.pop(job_id, None)
 
     if job_dir.exists():
         shutil.rmtree(job_dir)
     return {"ok": True}
-
-
-# -------------------- HOW TO RUN --------------------
-# 1) pip install fastapi uvicorn
-# 2) Make sure git and trivy are installed and available on PATH.
-# 3) uvicorn app:app --host 0.0.0.0 --port 5000 --reload
-# 4) Start a job:
-#    curl -X POST http://localhost:5000/api/scan_repo \
-#      -H 'Content-Type: application/json' \
-#      -d '{"id":"job123","giturl":"https://github.com/user/repo.git@branch"}'
-# 5) Poll for report:
-#    curl 'http://localhost:5000/api/getReport?ID=job123'
