@@ -159,9 +159,12 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
             deps_file = generate_dependency_tree(repo_path, current_folder)
             sbom_file = generate_go_sbom(repo_path, current_folder)
 
-            # Trivy scan
-            trivy_file = scan_trivy(sbom_file, current_folder)  # This generates sbom_trivy.json
-            trivy_cyclonedx_file = current_folder / "sbom_trivy_cyclonedx.json"  # Assuming scan_trivy creates this
+            # Trivy scan returns dict with multiple outputs
+            trivy_outputs = scan_trivy(sbom_file, current_folder)  
+
+            trivy_json_file = trivy_outputs.get("json")
+            trivy_cyclonedx_file = trivy_outputs.get("cyclonedx")
+            trivy_table_file = trivy_outputs.get("table")
 
             # Generate comparison
             comparison_file = current_folder / "comparison.txt"
@@ -171,14 +174,15 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
             artifacts.update({
                 "deps_file": str(deps_file),
                 "sbom_path": str(sbom_file),
-                "trivy_json_path": str(trivy_file),
+                "trivy_json_path": str(trivy_json_file),
                 "trivy_cyclonedx_path": str(trivy_cyclonedx_file),
+                "trivy_table_path": str(trivy_table_file),
                 "comparison_file": str(comparison_file)
             })
 
             # Load Trivy results into results
             try:
-                results["trivy_report_json"] = json.loads(trivy_file.read_text("utf-8"))
+                results["trivy_report_json"] = json.loads(trivy_json_file.read_text("utf-8"))
             except Exception:
                 results["trivy_report_json"] = None
 
@@ -188,16 +192,49 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
                 results["trivy_cyclonedx_json"] = None
 
 
+
+
         # -------------------- JAVA / MAVEN FLOW --------------------
         elif language == "Java" and manager == "maven":
             install_dir = current_folder / "maven_setup"
             install_dir.mkdir(exist_ok=True)
             zip_path = download_maven(install_dir)
             maven_home = extract_maven(zip_path, install_dir)
+
+            # Generate SBOM with Maven
             run_maven_sbom(maven_home, repo_path)
             sbom_path = copy_sbom(repo_path)
-            scan_maven_sbom(sbom_path, repo_path)
-            artifacts.update({"sbom_path": str(sbom_path)})
+
+            # Define Trivy output paths
+            trivy_json = repo_path / "sbom_trivy.json"
+            trivy_cyclonedx = repo_path / "sbom_trivy_cyclonedx.json"
+
+            # Run Trivy scans
+            try:
+                scan_maven_sbom(sbom_path, trivy_json, trivy_cyclonedx)
+            except TypeError:
+                # fallback in case your scan_maven_sbom only accepts (sbom, repo)
+                scan_maven_sbom(sbom_path, repo_path)
+                # if so, you should modify scan_maven_sbom to also take output paths
+
+            # Update artifacts
+            artifacts.update({
+                "sbom_path": str(sbom_path),
+                "trivy_json_path": str(trivy_json),
+                "trivy_cyclonedx_path": str(trivy_cyclonedx)
+            })
+
+            # Load results into report
+            try:
+                results["trivy_report_json"] = json.loads(trivy_json.read_text("utf-8"))
+            except Exception:
+                results["trivy_report_json"] = None
+
+            try:
+                results["trivy_cyclonedx_json"] = json.loads(trivy_cyclonedx.read_text("utf-8"))
+            except Exception:
+                results["trivy_cyclonedx_json"] = None
+
 
         else:
             artifacts["error"] = f"Unsupported language: {language}"
