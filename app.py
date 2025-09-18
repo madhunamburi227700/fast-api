@@ -191,9 +191,6 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
             except Exception:
                 results["trivy_cyclonedx_json"] = None
 
-
-
-
         # -------------------- JAVA / MAVEN FLOW --------------------
         elif language == "Java" and manager == "maven":
             install_dir = current_folder / "maven_setup"
@@ -201,39 +198,50 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
             zip_path = download_maven(install_dir)
             maven_home = extract_maven(zip_path, install_dir)
 
-            # Generate SBOM with Maven
-            run_maven_sbom(maven_home, repo_path)
+            # Determine Maven binary per OS
+            import platform
+            mvn_bin = "mvn.cmd" if platform.system() == "Windows" else "mvn"
+
+            # Generate SBOM with Maven (JSON output)
+            run_maven_sbom(maven_home, repo_path, mvn_bin=mvn_bin)
             sbom_path = copy_sbom(repo_path)
+            print(f"✅ SBOM generated at: {sbom_path}")
 
-            # Define Trivy output paths
-            trivy_json = repo_path / "sbom_trivy.json"
-            trivy_cyclonedx = repo_path / "sbom_trivy_cyclonedx.json"
+            # Scan SBOM with Trivy (JSON + CycloneDX)
+            from maven_trivy_scan import scan_sbom as scan_maven_sbom
+            trivy_outputs = scan_maven_sbom(sbom_path, repo_path)
+            trivy_json = trivy_outputs.get("json")
+            trivy_cyclonedx = trivy_outputs.get("cyclonedx")
 
-            # Run Trivy scans
-            try:
-                scan_maven_sbom(sbom_path, trivy_json, trivy_cyclonedx)
-            except TypeError:
-                # fallback in case your scan_maven_sbom only accepts (sbom, repo)
-                scan_maven_sbom(sbom_path, repo_path)
-                # if so, you should modify scan_maven_sbom to also take output paths
+            if trivy_json and trivy_json.exists():
+                print(f"✅ Trivy JSON report generated at: {trivy_json}")
+            else:
+                print("⚠️ Trivy JSON report not generated")
+
+            if trivy_cyclonedx and trivy_cyclonedx.exists():
+                print(f"✅ Trivy CycloneDX report generated at: {trivy_cyclonedx}")
+            else:
+                print("⚠️ Trivy CycloneDX report not generated")
 
             # Update artifacts
             artifacts.update({
-                "sbom_path": str(sbom_path),
-                "trivy_json_path": str(trivy_json),
-                "trivy_cyclonedx_path": str(trivy_cyclonedx)
+                "sbom_path": str(sbom_path.resolve()),
+                "trivy_json_path": str(trivy_json.resolve()) if trivy_json else None,
+                "trivy_cyclonedx_path": str(trivy_cyclonedx.resolve()) if trivy_cyclonedx else None
             })
 
             # Load results into report
             try:
-                results["trivy_report_json"] = json.loads(trivy_json.read_text("utf-8"))
+                results["trivy_report_json"] = json.loads(trivy_json.read_text("utf-8")) if trivy_json and trivy_json.exists() else None
             except Exception:
                 results["trivy_report_json"] = None
 
             try:
-                results["trivy_cyclonedx_json"] = json.loads(trivy_cyclonedx.read_text("utf-8"))
+                results["trivy_cyclonedx_json"] = json.loads(trivy_cyclonedx.read_text("utf-8")) if trivy_cyclonedx and trivy_cyclonedx.exists() else None
             except Exception:
                 results["trivy_cyclonedx_json"] = None
+
+
 
 
         else:

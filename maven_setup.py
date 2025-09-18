@@ -33,5 +33,13 @@ def extract_maven(zip_path: str, install_dir: str) -> str:
     print(f"📂 Extracting Maven to {install_dir} ...")
     with zipfile.ZipFile(zip_path, "r") as zip_ref:
         zip_ref.extractall(install_dir)
-    print("✅ Extraction complete")
+
+    # Make mvn and all bin files executable (Linux/macOS)
+    if platform.system() != "Windows":
+        bin_dir = os.path.join(extract_path, "bin")
+        if os.path.exists(bin_dir):
+            for f in os.listdir(bin_dir):
+                os.chmod(os.path.join(bin_dir, f), 0o755)  # rwxr-xr-x
+
+    print("✅ Extraction complete and binaries made executable")
     return extract_path
