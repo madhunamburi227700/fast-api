@@ -1,5 +1,7 @@
 import os
+import platform
 from pathlib import Path
+
 from os_detect import detect_os
 from git_repo import clone_and_checkout
 from venv_manager import setup, remove_venv
@@ -17,9 +19,9 @@ from go_compare import generate_comparison
 
 # Java / Maven
 from maven_generate_sbom import run_maven_sbom, copy_sbom
-from maven_setup import download_maven, extract_maven
+from maven_setup import download_maven, extract_maven, get_mvn_path
 from maven_trivy_scan import scan_sbom as scan_maven_sbom
-
+from shutil import which
 
 def main():
     env_name = "sbom-env"
@@ -47,6 +49,7 @@ def main():
 
     current_folder = Path.cwd()
 
+    # -------------------- PYTHON FLOW --------------------
     if language == "Python":
         venv_path = setup(env_name=env_name, project_path=repo_path)
         print(f"\n➡ Virtual environment created at: {venv_path}")
@@ -56,7 +59,10 @@ def main():
         if dets_file.exists():
             convert_json(dets_file, repo_path / "normalized_deps.json")
 
-        dep_file = next((repo_path / f for f in ["all-dep.txt", "a.txt"] if (repo_path / f).exists()), None)
+        dep_file = next(
+            (repo_path / f for f in ["all-dep.txt", "a.txt"] if (repo_path / f).exists()),
+            None
+        )
         if dep_file:
             generate_python_sbom(env_name, dep_file, repo_path / "sbom.json")
 
@@ -73,6 +79,7 @@ def main():
         remove_venv(venv_path)
         print(f"✅ Virtual environment '{venv_path}' removed automatically.")
 
+    # -------------------- GO FLOW --------------------
     elif language == "Go":
         upgrade_file = prepare_dependencies(repo_path, current_folder)
         install_deptree()
@@ -88,28 +95,45 @@ def main():
         print(f"Trivy report: {trivy_file}")
         print(f"Comparison: {comparison_file}")
 
-# -------------------- JAVA / MAVEN FLOW --------------------
+    # -------------------- JAVA / MAVEN FLOW --------------------
     elif language == "Java" and manager == "maven":
-        install_dir = current_folder / "maven_setup"
-        install_dir.mkdir(exist_ok=True)
-        zip_path = download_maven(install_dir)
-        maven_home = extract_maven(zip_path, install_dir)
 
-        # Determine Maven binary per OS
-        import platform
-        mvn_bin = "mvn.cmd" if platform.system() == "Windows" else "mvn"
+        # -------------------- Try System Maven First --------------------
+        mvn_path = which("mvn")
+        if mvn_path:
+            print(f"🔍 Found system Maven at: {mvn_path}")
+        else:
+            print("⚠️ System Maven not found, will download a fresh copy...")
 
-        # Generate SBOM with Maven (JSON output)
-        run_maven_sbom(maven_home, repo_path, mvn_bin=mvn_bin)
+            # -------------------- Download + Extract Maven --------------------
+        maven_dir = repo_path / "maven"
+        maven_dir.mkdir(exist_ok=True)
+        print(f"📂 Maven directory: {maven_dir}")
+
+        zip_path = download_maven(str(maven_dir))
+        print(f"⬇️ Maven ZIP downloaded at: {zip_path}")
+
+        maven_home = extract_maven(str(zip_path), str(maven_dir))
+        print(f"📦 Maven extracted to: {maven_home}")
+
+            # -------------------- Get Maven Binary --------------------
+        mvn_path = get_mvn_path(maven_home)
+        print(f"✅ Using Maven binary at: {mvn_path}")
+
+            # -------------------- Generate SBOM --------------------
+        print("⚙️ Running Maven SBOM generation...")
+        run_maven_sbom(maven_home, repo_path, mvn_bin=mvn_path)
+
         sbom_path = copy_sbom(repo_path)
-        print(f"✅ SBOM generated at: {sbom_path}")
+        print(f"✅ SBOM generated and copied to: {sbom_path}")
 
-        # Scan SBOM with Trivy (JSON only)
-        from maven_trivy_scan import scan_sbom as scan_maven_sbom
+            # -------------------- Scan SBOM --------------------
+        print("🔍 Running Trivy scan on generated SBOM...")
         trivy_outputs = scan_maven_sbom(sbom_path, repo_path)
-        trivy_json = trivy_outputs.get("json")  # Only JSON output
+        trivy_json = trivy_outputs.get("json")
+        trivy_cyclonedx = trivy_outputs.get("cyclonedx")
 
-
+    # -------------------- UNSUPPORTED --------------------
     else:
         print(f"⚠️ Unsupported language: {language}. No specific flow defined.")
 

@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel, Field
+from shutil import which
 
 # -------------------- IMPORT HELPERS --------------------
 from os_detect import detect_os
@@ -26,8 +27,8 @@ from sbom_generator import generate_sbom as generate_go_sbom
 from go_trivy_scan import scan_trivy
 from go_compare import generate_comparison
 from maven_generate_sbom import run_maven_sbom, copy_sbom
-from maven_setup import download_maven, extract_maven
-from maven_trivy_scan import scan_sbom as scan_maven_sbom
+from maven_setup import get_mvn_path
+from maven_trivy_scan import scan_sbom
 
 # -------------------- FASTAPI APP --------------------
 app = FastAPI(title="SBOM Scanner API", version="3.0.0")
@@ -110,20 +111,17 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
             artifacts["venv_path"] = venv_path
             install_dependencies(env_name, repo_path)
 
-            # Normalize dets.json
             dets_file = repo_path / "dets.json"
             if dets_file.exists():
                 convert_json(dets_file, repo_path / "normalized_deps.json")
                 artifacts["normalized_deps_path"] = str((repo_path / "normalized_deps.json").resolve())
 
-            # Dependency file
             dep_file = next((repo_path / f for f in ["all-dep.txt", "a.txt"] if (repo_path / f).exists()), None)
             if dep_file:
                 artifacts["dep_file_path"] = str(dep_file)
                 generate_python_sbom(env_name, dep_file, repo_path / "sbom.json")
                 artifacts["sbom_path"] = str((repo_path / "sbom.json").resolve())
 
-                # Trivy scan
                 sbom_p = repo_path / "sbom_p.json"
                 trivy_json = repo_path / "trivy_report.json"
                 table_trivy = repo_path / "table_trivy.txt"
@@ -136,7 +134,6 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
                 artifacts["trivy_json_path"] = str(trivy_json.resolve())
                 artifacts["trivy_table_path"] = str(table_trivy.resolve())
 
-                # Load Trivy & CycloneDX results
                 try:
                     results["trivy_report_json"] = json.loads(trivy_json.read_text("utf-8"))
                 except Exception:
@@ -146,7 +143,6 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
                 except Exception:
                     results["trivy_cyclonedx_json"] = None
 
-                # Compare normalized
                 if artifacts["normalized_deps_path"]:
                     compare(sbom_p, repo_path / "normalized_deps.json")
 
@@ -154,23 +150,19 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
 
         # -------------------- GO FLOW --------------------
         elif language == "Go":
-            upgrade_file = prepare_dependencies(repo_path, current_folder)
+            prepare_dependencies(repo_path, current_folder)
             install_deptree()
             deps_file = generate_dependency_tree(repo_path, current_folder)
             sbom_file = generate_go_sbom(repo_path, current_folder)
 
-            # Trivy scan returns dict with multiple outputs
-            trivy_outputs = scan_trivy(sbom_file, current_folder)  
-
+            trivy_outputs = scan_trivy(sbom_file, current_folder)
             trivy_json_file = trivy_outputs.get("json")
             trivy_cyclonedx_file = trivy_outputs.get("cyclonedx")
             trivy_table_file = trivy_outputs.get("table")
 
-            # Generate comparison
             comparison_file = current_folder / "comparison.txt"
             generate_comparison(deps_file, sbom_file, comparison_file)
 
-            # Update artifacts
             artifacts.update({
                 "deps_file": str(deps_file),
                 "sbom_path": str(sbom_file),
@@ -180,12 +172,10 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
                 "comparison_file": str(comparison_file)
             })
 
-            # Load Trivy results into results
             try:
                 results["trivy_report_json"] = json.loads(trivy_json_file.read_text("utf-8"))
             except Exception:
                 results["trivy_report_json"] = None
-
             try:
                 results["trivy_cyclonedx_json"] = json.loads(trivy_cyclonedx_file.read_text("utf-8"))
             except Exception:
@@ -193,57 +183,52 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
 
         # -------------------- JAVA / MAVEN FLOW --------------------
         elif language == "Java" and manager == "maven":
-            install_dir = current_folder / "maven_setup"
-            install_dir.mkdir(exist_ok=True)
-            zip_path = download_maven(install_dir)
-            maven_home = extract_maven(zip_path, install_dir)
-
-            # Determine Maven binary per OS
-            import platform
-            mvn_bin = "mvn.cmd" if platform.system() == "Windows" else "mvn"
-
-            # Generate SBOM with Maven (JSON output)
-            run_maven_sbom(maven_home, repo_path, mvn_bin=mvn_bin)
-            sbom_path = copy_sbom(repo_path)
-            print(f"✅ SBOM generated at: {sbom_path}")
-
-            # Scan SBOM with Trivy (JSON + CycloneDX)
-            from maven_trivy_scan import scan_sbom as scan_maven_sbom
-            trivy_outputs = scan_maven_sbom(sbom_path, repo_path)
-            trivy_json = trivy_outputs.get("json")
-            trivy_cyclonedx = trivy_outputs.get("cyclonedx")
-
-            if trivy_json and trivy_json.exists():
-                print(f"✅ Trivy JSON report generated at: {trivy_json}")
-            else:
-                print("⚠️ Trivy JSON report not generated")
-
-            if trivy_cyclonedx and trivy_cyclonedx.exists():
-                print(f"✅ Trivy CycloneDX report generated at: {trivy_cyclonedx}")
-            else:
-                print("⚠️ Trivy CycloneDX report not generated")
-
-            # Update artifacts
-            artifacts.update({
-                "sbom_path": str(sbom_path.resolve()),
-                "trivy_json_path": str(trivy_json.resolve()) if trivy_json else None,
-                "trivy_cyclonedx_path": str(trivy_cyclonedx.resolve()) if trivy_cyclonedx else None
-            })
-
-            # Load results into report
             try:
-                results["trivy_report_json"] = json.loads(trivy_json.read_text("utf-8")) if trivy_json and trivy_json.exists() else None
-            except Exception:
-                results["trivy_report_json"] = None
+                mvn_path = get_mvn_path()
+                if not mvn_path:
+                    raise RuntimeError("❌ System Maven not found. Please install Maven.")
+                print(f"✅ Using system Maven: {mvn_path}")
 
-            try:
-                results["trivy_cyclonedx_json"] = json.loads(trivy_cyclonedx.read_text("utf-8")) if trivy_cyclonedx and trivy_cyclonedx.exists() else None
-            except Exception:
-                results["trivy_cyclonedx_json"] = None
+                # Generate SBOM
+                print("⚙️ Running Maven SBOM generation...")
+                run_maven_sbom(repo_path, mvn_bin=mvn_path)
+                sbom_path = copy_sbom(repo_path)
+                artifacts["sbom_path"] = str(sbom_path.resolve())
+                print(f"✅ SBOM generated at: {sbom_path}")
+
+                # Scan SBOM
+                print("🔍 Running Trivy scan on generated SBOM...")
+                trivy_outputs = scan_sbom(sbom_path, repo_path)
+                trivy_json = trivy_outputs.get("json")
+                trivy_cyclonedx = trivy_outputs.get("cyclonedx")
+
+                artifacts["trivy_json_path"] = str(trivy_json.resolve()) if trivy_json else None
+                artifacts["trivy_cyclonedx_path"] = str(trivy_cyclonedx.resolve()) if trivy_cyclonedx else None
+
+                if trivy_json:
+                    print(f"📄 Trivy JSON report: {trivy_json}")
+                if trivy_cyclonedx:
+                    print(f"📄 Trivy CycloneDX report: {trivy_cyclonedx}")
+
+                try:
+                    results["trivy_report_json"] = json.loads(trivy_json.read_text("utf-8")) if trivy_json else None
+                except Exception:
+                    results["trivy_report_json"] = None
+                try:
+                    results["trivy_cyclonedx_json"] = json.loads(trivy_cyclonedx.read_text("utf-8")) if trivy_cyclonedx else None
+                except Exception:
+                    results["trivy_cyclonedx_json"] = None
+
+            except Exception as e:
+                artifacts["error"] = str(e)
+                print(f"❌ Maven flow failed: {e}")
 
 
 
 
+
+
+        
         else:
             artifacts["error"] = f"Unsupported language: {language}"
 
@@ -253,7 +238,6 @@ def run_pipeline(repo_with_branch: str, job_dir: Path) -> Dict[str, Any]:
         "results": results,
         "generated_at": now_iso()
     }
-
     (job_dir / "report.json").write_text(json.dumps(report, indent=2), "utf-8")
     return report
 

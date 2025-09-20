@@ -1,33 +1,40 @@
-# maven_generate_sbom.py
 import subprocess
 from pathlib import Path
-import platform
 import shutil
 
-def run_maven_sbom(maven_home: Path, repo_path: Path, mvn_bin: str | None = None):
+from maven_setup import get_mvn_path
+
+def run_maven_sbom(repo_path: Path, mvn_bin: str | Path | None = None):
     """
     Run Maven CycloneDX plugin to generate SBOM in JSON format.
-    mvn_bin: optional Maven executable name (mvn or mvn.cmd)
     """
-    mvn_bin = mvn_bin or ("mvn.cmd" if platform.system() == "Windows" else "mvn")
-    mvn_path = Path(maven_home) / "bin" / mvn_bin
-    mvn_path = str(mvn_path.resolve())
+    mvn_path = Path(mvn_bin) if mvn_bin else get_mvn_path()
+
+    if not mvn_path.exists():
+        raise FileNotFoundError(f"❌ Maven binary not found: {mvn_path}")
 
     cmd = [
-        mvn_path,
+        str(mvn_path),
         "org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom",
-        "-DoutputFormat=json"  # <-- generate JSON instead of XML
+        "-DoutputFormat=json"
     ]
+
+    print(f"🔧 Maven binary path: {mvn_path}")
+    print(f"📁 Working directory: {repo_path}")
+    print(f"📦 Running command: {' '.join(cmd)}")
+
     subprocess.run(cmd, cwd=repo_path, check=True)
-    print("✅ Maven SBOM generated in JSON format")
+
 
 def copy_sbom(repo_path: Path) -> Path:
     """
-    Copy generated JSON BOM to a standard location.
+    Copy generated JSON BOM to repo root.
     """
-    bom_file = repo_path / "target" / "bom.json"  # JSON file now
+    bom_file = repo_path / "target" / "bom.json"
     if not bom_file.exists():
-        raise FileNotFoundError(f"JSON BOM not found at {bom_file}")
-    dest = repo_path / "sbom.json"  # consistent with other flows
+        raise FileNotFoundError(f"❌ JSON BOM not found at {bom_file}")
+
+    dest = repo_path / "sbom.json"
     shutil.copy(bom_file, dest)
+    print(f"✅ SBOM copied to {dest}")
     return dest
