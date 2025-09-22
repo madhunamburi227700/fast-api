@@ -19,8 +19,8 @@ from go_compare import generate_comparison
 
 # Java / Maven
 from maven_generate_sbom import run_maven_sbom, copy_sbom
-from maven_setup import download_maven, extract_maven, get_mvn_path
-from maven_trivy_scan import scan_sbom as scan_maven_sbom
+from maven_setup import get_mvn_path
+from maven_trivy_scan import scan_sbom
 from shutil import which
 
 def main():
@@ -97,41 +97,27 @@ def main():
 
     # -------------------- JAVA / MAVEN FLOW --------------------
     elif language == "Java" and manager == "maven":
+        try:
+            # Step 1: Detect Maven
+            mvn_path = get_mvn_path()
+            if not mvn_path:
+                raise RuntimeError("❌ System Maven not found. Please install Maven.")
+            print(f"✅ Using system Maven: {mvn_path}")
 
-        # -------------------- Try System Maven First --------------------
-        mvn_path = which("mvn")
-        if mvn_path:
-            print(f"🔍 Found system Maven at: {mvn_path}")
-        else:
-            print("⚠️ System Maven not found, will download a fresh copy...")
+            # Generate SBOM
+            print("⚙️ Running Maven SBOM generation...")
+            run_maven_sbom(repo_path, mvn_bin=mvn_path)
+            sbom_path = copy_sbom(repo_path)
+            print(f"✅ SBOM generated at: {sbom_path}")
 
-            # -------------------- Download + Extract Maven --------------------
-        maven_dir = repo_path / "maven"
-        maven_dir.mkdir(exist_ok=True)
-        print(f"📂 Maven directory: {maven_dir}")
+            # Scan SBOM
+            print("🔍 Running Trivy scan on generated SBOM...")
+            trivy_outputs = scan_sbom(sbom_path, repo_path)
+            trivy_json = trivy_outputs.get("json")
+            trivy_cyclonedx = trivy_outputs.get("cyclonedx")
 
-        zip_path = download_maven(str(maven_dir))
-        print(f"⬇️ Maven ZIP downloaded at: {zip_path}")
-
-        maven_home = extract_maven(str(zip_path), str(maven_dir))
-        print(f"📦 Maven extracted to: {maven_home}")
-
-            # -------------------- Get Maven Binary --------------------
-        mvn_path = get_mvn_path(maven_home)
-        print(f"✅ Using Maven binary at: {mvn_path}")
-
-            # -------------------- Generate SBOM --------------------
-        print("⚙️ Running Maven SBOM generation...")
-        run_maven_sbom(maven_home, repo_path, mvn_bin=mvn_path)
-
-        sbom_path = copy_sbom(repo_path)
-        print(f"✅ SBOM generated and copied to: {sbom_path}")
-
-            # -------------------- Scan SBOM --------------------
-        print("🔍 Running Trivy scan on generated SBOM...")
-        trivy_outputs = scan_maven_sbom(sbom_path, repo_path)
-        trivy_json = trivy_outputs.get("json")
-        trivy_cyclonedx = trivy_outputs.get("cyclonedx")
+        except Exception as e:
+            print(f"❌ Maven flow failed: {e}")
 
     # -------------------- UNSUPPORTED --------------------
     else:
