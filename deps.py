@@ -52,3 +52,5 @@ def install_dependencies(env_name, project_path):
                 continue
             subprocess.run(["uv", "pip", "compile", req_file, "-o", "all-dep.txt"], check=True)
             subprocess.run(pipgrip_cmd + ["--tree-json-exact", "-r", "all-dep.txt"], stdout=open("dets.json", "w"), check=True)
+
+            
